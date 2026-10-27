@@ -21,14 +21,14 @@ HOST_PADRAO = "10.13.123.0"
 PORTA_PADRAO = 54321
 CRLF = "\r\n"
 CMD_LISTAR = "LIST"
-CMD_SELECIONAR = "SELECT {id}"        # sintaxe deduzida da resposta ao LIST
-SEP = "|"                             # separador de campos dos registros
+CMD_SELECIONAR = "STREAM;{id}"        # sintaxe deduzida da resposta ao LIST
+SEP = ";"                             # separador de campos dos registros
 FIM_LISTA = "END|LIST"                # linha que encerra a resposta do LIST
 # Regex que extrai (id, nome) de cada linha de estação na resposta do LIST
 RE_ESTACAO = re.compile(r"^(\d{3})\W+(.*)$")
 # Tipos de registro dentro de um ciclo
 REG_INICIO, REG_FIM = "BEGIN", "END"
-REG_TEMP, REG_UMID, REG_PRES = "TEMP", "HUM", "PRES"
+REG_TEMP, REG_UMID, REG_PRES = "TEMP", "HUM", "PRESS"
 # ===============================================================================
 
 RAW = False
@@ -71,22 +71,32 @@ def enviar_comando(sock, cmd):
     if RAW:
         print(f"[send {len(cmd) + 2:>4} bytes] {(cmd + CRLF).encode()!r}")
 
-
 def listar_estacoes(sock, leitor):
-    """Envia LIST e lê a resposta até o marcador de fim (ou até silêncio de 1.5 s)."""
-    enviar_comando(sock, CMD_LISTAR)
+    """Envia LIST e extrai apenas as estações válidas da resposta 210;STATIONS;..."""
+    enviar_comando(sock, "LIST")
     estacoes = {}
+    
     while True:
         linha = leitor.ler_linha(timeout=1.5)
         if linha is None or linha == FIM_LISTA:
             break
-        m = RE_ESTACAO.match(linha)
-        if m:
-            estacoes[m.group(1)] = m.group(2)
-        elif RAW:
-            print(f"(linha ignorada na lista: {linha!r})")
-    return estacoes
+            
+        partes = linha.strip().split(";")
+        
+        # Filtra estritamente o pacote que é a resposta da lista de estações
+        if len(partes) >= 3 and partes[0] == "210" and partes[1] == "STATIONS":
+            # partes[2:] pega apenas a partir do terceiro elemento ('001', '002', '003'...)
+            ids_encontrados = partes[2:]
+            
+            for est_id in ids_encontrados:
+                est_id = est_id.strip()
+                if est_id:
+                    estacoes[est_id] = f"Estação {est_id}"
+            
+            # Uma vez processada a linha de estações, pode interromper o loop
+            break
 
+    return estacoes
 
 def novo_ciclo(est, n):
     return {"estacao": est, "ciclo": n, "temp": None, "umid": None, "pres": None}
@@ -94,28 +104,43 @@ def novo_ciclo(est, n):
 
 def processar_linha(linha, atual):
     """
-    Máquina de estados simples: BEGIN abre um ciclo, TEMP/HUM/PRES o preenchem
+    Máquina de estados simples: BEGIN abre um ciclo, TEMP/HUM/PRESS o preenchem
     e END o fecha. Devolve (ciclo_em_andamento, ciclo_completo_ou_None).
-    Assim nunca misturamos medições de ciclos diferentes.
     """
-    campos = linha.split(SEP)
+    if not linha:
+        return atual, None
+
+    campos = linha.strip().split(SEP)
     tipo = campos[0]
+
     try:
+        # 1. Início do ciclo
         if tipo == REG_INICIO:
+            # Garante a criação de um novo ciclo com campos zerados
             return novo_ciclo(campos[1], campos[2]), None
-        if atual is None:               # lixo antes de um BEGIN: ignora
+
+        # 2. Ignora qualquer linha antes de receber o primeiro BEGIN
+        if atual is None:
             return None, None
+
+        # 3. Leitura dos sensores
         if tipo == REG_TEMP:
             atual["temp"] = (float(campos[1]), campos[2])
         elif tipo == REG_UMID:
             atual["umid"] = (float(campos[1]), campos[2])
         elif tipo == REG_PRES:
             atual["pres"] = (float(campos[1]), campos[2])
+
+        # 4. Fim do ciclo
         elif tipo == REG_FIM:
-            completo = all(atual[k] is not None for k in ("temp", "umid", "pres"))
+            # Verifica se todos os campos foram preenchidos
+            completo = all(atual.get(k) is not None for k in ("temp", "umid", "pres"))
             return None, (atual if completo else None)
-    except (IndexError, ValueError):
-        print(f"(registro malformado ignorado: {linha!r})")
+
+    except (IndexError, ValueError) as e:
+        if RAW:
+            print(f"(registro malformado ignorado: {linha!r})")
+
     return atual, None
 
 
@@ -188,6 +213,7 @@ def main():
         print(f"Mensagem inicial do servidor: {banner!r}")
 
     estacoes = listar_estacoes(sock, leitor)
+
     if not estacoes:
         sys.exit("Nenhuma estação reconhecida na resposta do LIST. "
                  "Use --raw / --explorar e ajuste RE_ESTACAO.")
